@@ -1281,14 +1281,16 @@ namespace jpgd {
 		for (int i = 0; i < JPGD_MAX_BLOCKS_PER_MCU; i++)
 			m_mcu_block_max_zag[i] = 64;
 
-		m_has_sse2 = false;
+		m_simd_mode = NO_SIMD;
 
 #if JPGD_USE_SSE2
 #ifdef _MSC_VER
 		int cpu_info[4];
 		__cpuid(cpu_info, 1);
-		const int cpu_info3 = cpu_info[3];
-		m_has_sse2 = ((cpu_info3 >> 26U) & 1U) != 0U;
+		m_simd_mode = ((cpu_info[3] >> 26U) & 1U) != 0U ? simd_mode::SSE2 : simd_mode::NO_SIMD;
+
+		__cpuid(cpu_info, 7);
+		m_simd_mode = ((cpu_info[1] >> 5U) & 1U) != 0U ? simd_mode::AVX2 : m_simd_mode;
 #else
 		m_has_sse2 = true;
 #endif
@@ -1343,7 +1345,7 @@ namespace jpgd {
 
 		for (int mcu_block = 0; mcu_block < m_blocks_per_mcu; mcu_block++)
 		{
-			idct(pSrc_ptr, pDst_ptr, m_mcu_block_max_zag[mcu_block], ((m_flags & cFlagDisableSIMD) == 0) && m_has_sse2);
+			idct(pSrc_ptr, pDst_ptr, m_mcu_block_max_zag[mcu_block], ((m_flags & cFlagDisableSIMD) == 0) && (m_simd_mode >= simd_mode::SSE2));
 			pSrc_ptr += 64;
 			pDst_ptr += 64;
 		}
@@ -1598,7 +1600,67 @@ namespace jpgd {
 		uint8* s = m_pSample_buf + row * 8;
 
 #if JPGD_USE_SSE2
-		if (m_has_sse2) 
+		if (((m_flags & cFlagDisableSIMD) == 0) && (m_simd_mode >= simd_mode::AVX2))
+		{
+			__m256i zero = _mm256_setzero_si256();
+			__m256i maxClamp = _mm256_set1_epi32(255);
+			__m256i resultInit = _mm256_set1_epi32(0xFF000000);
+
+			__m128i loShuffle = _mm_set_epi8(
+				0x80U, 0x80U, 0x80U, 3,
+				0x80U, 0x80U, 0x80U, 2,
+				0x80U, 0x80U, 0x80U, 1,
+				0x80U, 0x80U, 0x80U, 0);
+
+			__m128i hiShuffle = _mm_set_epi8(
+				0x80U, 0x80U, 0x80U, 7,
+				0x80U, 0x80U, 0x80U, 6,
+				0x80U, 0x80U, 0x80U, 5,
+				0x80U, 0x80U, 0x80U, 4);
+
+			for (int i = m_max_mcus_per_row; i > 0; i--) 
+			{
+				__m128i loVals = _mm_loadu_si64(s);
+				__m256i y = _mm256_set_m128i(_mm_shuffle_epi8(loVals, hiShuffle), _mm_shuffle_epi8(loVals, loShuffle));
+
+				__m128i midVals = _mm_loadu_si64(s + 64);
+				__m128i hiVals = _mm_loadu_si64(s + 128);
+
+				__m256i midIndices = _mm256_set_m128i(_mm_shuffle_epi8(midVals, hiShuffle), _mm_shuffle_epi8(midVals, loShuffle));
+				__m256i hiIndices = _mm256_set_m128i(_mm_shuffle_epi8(hiVals, hiShuffle), _mm_shuffle_epi8(hiVals, loShuffle));
+
+				__m256i mCrr = _mm256_i32gather_epi32(m_crr, hiIndices, 4);
+				__m256i mCrg = _mm256_i32gather_epi32(m_crg, hiIndices, 4);
+				__m256i mCbg = _mm256_i32gather_epi32(m_cbg, midIndices, 4);
+				__m256i mCbb = _mm256_i32gather_epi32(m_cbb, midIndices, 4);
+
+				__m256i mCbgResult = _mm256_srai_epi32(_mm256_add_epi32(mCrg, mCbg), 16);
+
+				__m256i val0 = _mm256_add_epi32(y, mCrr);
+				__m256i val1 = _mm256_add_epi32(y, mCbgResult);
+				__m256i val2 = _mm256_add_epi32(y, mCbb);
+
+				val0 = _mm256_min_epi32(val0, maxClamp);
+				val0 = _mm256_max_epi32(val0, zero);
+
+				val1 = _mm256_min_epi32(val1, maxClamp);
+				val1 = _mm256_max_epi32(val1, zero);
+
+				val2 = _mm256_min_epi32(val2, maxClamp);
+				val2 = _mm256_max_epi32(val2, zero);
+
+				__m256i result = resultInit;
+				result = _mm256_or_si256(result, _mm256_slli_epi32(val2, 16));
+				result = _mm256_or_si256(result, _mm256_slli_epi32(val1, 8));
+				result = _mm256_or_si256(result, val0);
+
+				_mm256_storeu_si256((__m256i*)(d), result);
+
+				d += 32;
+				s += 64 * 3;
+			}
+		}
+		else if (((m_flags & cFlagDisableSIMD) == 0) && (m_simd_mode >= simd_mode::SSE2))
 		{
 			__m128i zero = _mm_setzero_si128();
 			__m128i maxClamp = _mm_set1_epi16(255);
@@ -1617,8 +1679,8 @@ namespace jpgd {
 
 				__m128i mCbb = _mm_set_epi16((short)m_cbb[s[71]], (short)m_cbb[s[70]], (short)m_cbb[s[69]], (short)m_cbb[s[68]], (short)m_cbb[s[67]], (short)m_cbb[s[66]], (short)m_cbb[s[65]], (short)m_cbb[s[64]]);
 
-				__m128i mCbgLoResult = _mm_srli_epi32(_mm_add_epi32(mCrgLo, mCbgLo), 16);
-				__m128i mCbgHiResult = _mm_srli_epi32(_mm_add_epi32(mCrgHi, mCbgHi), 16);
+				__m128i mCbgLoResult = _mm_srai_epi32(_mm_add_epi32(mCrgLo, mCbgLo), 16);
+				__m128i mCbgHiResult = _mm_srai_epi32(_mm_add_epi32(mCrgHi, mCbgHi), 16);
 
 				__m128i mCrgCbgSum = _mm_set_epi16((short)mCbgHiResult.m128i_i32[3], (short)mCbgHiResult.m128i_i32[2], (short)mCbgHiResult.m128i_i32[1], (short)mCbgHiResult.m128i_i32[0],
 					(short)mCbgLoResult.m128i_i32[3], (short)mCbgLoResult.m128i_i32[2], (short)mCbgLoResult.m128i_i32[1], (short)mCbgLoResult.m128i_i32[0]);
@@ -1650,7 +1712,6 @@ namespace jpgd {
 				_mm_storeu_si128((__m128i*)(d + 16), result1);
 
 				d += 32;
-
 				s += 64 * 3;
 			}
 		}
